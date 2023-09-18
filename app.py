@@ -1,221 +1,203 @@
-from __future__ import division
+import cv2				# Import OpenCV for image processing
+import sys				# Import for time
+import os				# Import for reading files
+import threading		# Import for separate thread for image classification
+import numpy as np 		# Import for converting vectors
+from gtts import gTTS   # Import Google Text to Speech
+#import spell_checker	# Import for spelling corrections
 
-# Our Backend for the App!
-# Built with Flask
+# Disable tensorflow compilation warnings
+os.environ['TF_CPP_MIN_LOG_LEVEL']='2'
+import tensorflow as tf # Import tensorflow for Inception Net's backend
 
-# Import Flask
-import flask
-import requests
-import os
-from flask import send_file
+# Language in which you want to convert
+language = 'en'
 
-import re
-import sys
+# Get a live stream from the webcam
+live_stream = cv2.VideoCapture(0)
 
-from google.cloud import speech
-#from google.cloud.speech_v1 import speech
-#from google.cloud.speech_v1 import speech
-import pyaudio
-from six.moves import queue
+# Word for which letters are currently being signed
+current_word = ""
 
-# Audio recording parameters
-RATE = 16000
-CHUNK = int(RATE / 10)  # 100ms
+# Load training labels file
+label_lines = [line.rstrip() for line in tf.gfile.GFile("training_set_labels.txt")]
 
-# Create the application
-app = flask.Flask(__name__)
+# Load trained model's graph
+with tf.gfile.FastGFile("trained_model_graph.pb", 'rb') as f:
+	# Define a tensorflow graph
+    graph_def = tf.GraphDef()
 
-# serving home.html
-@app.route('/', methods=['GET'])
-def serve_page():
-    return flask.render_template('home.html')
+    # Read and import line by line from the trained model's graph
+    graph_def.ParseFromString(f.read())
+    _ = tf.import_graph_def(graph_def, name='')
 
-# process query
-@app.route('/process_query', methods=['POST'])
-def process_query():
-    data = flask.request.form  # is a dictionary
-    input = data['user_input']
-    input_in_list = input.split(' ')
-    return flask.render_template('home.html', same=processInput(input_in_list), og=input)
+def predict(image_data):
 
+	# Focus on Region of Interest (Image within the bounding box)
+	resized_image = image_data[70:350, 70:350]
+	
+	# Resize to 200 x 200
+	resized_image = cv2.resize(resized_image, (200, 200))
+	
+	image_data = cv2.imencode('.jpg', resized_image)[1].tostring()
 
-def processInput(input_in_list):
-    for s, i in enumerate(input_in_list):
-        if "bye" in i.lower():
-            input_in_list[s] = "static/bye.jpg"
-        if "hello" in i.lower():
-            input_in_list[s] = "static/hello.png"
-        if "yes" in i.lower():
-            input_in_list[s] = "static/yes.png"
-        if "no" in i.lower():
-            input_in_list[s] = "static/no.png"
-        if "please" in i.lower():
-            input_in_list[s] = "static/please.png"
-        if "thanks" in i.lower():
-            input_in_list[s] = "static/thanks.png"
-        if "who" in i.lower():
-            input_in_list[s] = "static/who.png"
-        if "what" in i.lower():
-            input_in_list[s] = "static/what.png"
-        if "when" in i.lower():
-            input_in_list[s] = "static/when.png"
-        if "where" in i.lower():
-            input_in_list[s] = "static/where.png"
-        if "why" in i.lower():
-            input_in_list[s] = "static/why.png"
-        if "which" in i.lower():
-            input_in_list[s] = "static/which.png"
-        if "how" in i.lower():
-            input_in_list[s] = "static/how.png"
-    return input_in_list
+	predictions = sess.run(softmax_tensor, {'DecodeJpeg/contents:0': image_data})
 
+	# Sort to show labels of first prediction in order of confidence
+	top_k = predictions[0].argsort()[-len(predictions[0]):][::-1]
 
-class MicrophoneStream(object):
-    """Opens a recording stream as a generator yielding the audio chunks."""
+	max_score = 0.0
+	res = ''
+	for node_id in top_k:
+		# Just to get rid of the Z error for demo
+		if label_lines[node_id].upper() == 'Z':
+			human_string = label_lines[node_id+1]
+		else:
+			human_string = label_lines[node_id]
+		score = predictions[0][node_id]
+		if score > max_score:	
+			max_score = score
+			res = human_string
 
-    def __init__(self, rate, chunk):
-        self._rate = rate
-        self._chunk = chunk
+	return res, max_score
 
-        # Create a thread-safe buffer of audio data
-        self._buff = queue.Queue()
-        self.closed = True
+def speak_letter(letter):
+	# Create the text to be spoken
+    prediction_text = letter
+    
+    # Create a speech object from text to be spoken
+    speech_object = gTTS(text=prediction_text, lang=language, slow=False)
 
-    def __enter__(self):
-        self._audio_interface = pyaudio.PyAudio()
-        self._audio_stream = self._audio_interface.open(
-            format=pyaudio.paInt16,
-            # The API currently only supports 1-channel (mono) audio
-            # https://goo.gl/z757pE
-            channels=1, rate=self._rate,
-            input=True, frames_per_buffer=self._chunk,
-            # Run the audio stream asynchronously to fill the buffer object.
-            # This is necessary so that the input device's buffer doesn't
-            # overflow while the calling thread makes network requests, etc.
-            stream_callback=self._fill_buffer,
-        )
+    # Save the speech object in a file called 'prediction.mp3'
+    speech_object.save("prediction.mp3")
+ 
+    # Playing the speech using mpg321
+    #os.system("afplay prediction.mp3")
 
-        self.closed = False
+with tf.Session() as sess:
+	# Feed the image_data as input to the graph and get first prediction
+	softmax_tensor = sess.graph.get_tensor_by_name('final_result:0')
 
-        return self
+	# Global variable to keep track of time
+	time_counter = 0
 
-    def __exit__(self, type, value, traceback):
-        self._audio_stream.stop_stream()
-        self._audio_stream.close()
-        self.closed = True
-        # Signal the generator to terminate so that the client's
-        # streaming_recognize method will not block the process termination.
-        self._buff.put(None)
-        self._audio_interface.terminate()
+	# Flag to check if 'c' is pressed
+	captureFlag = False
 
-    def _fill_buffer(self, in_data, frame_count, time_info, status_flags):
-        """Continuously collect data from the audio stream, into the buffer."""
-        self._buff.put(in_data)
-        return None, pyaudio.paContinue
+	# Toggle real time processing
+	realTime = True
 
-    def generator(self):
-        while not self.closed:
-            # Use a blocking get() to ensure there's at least one chunk of
-            # data, and stop iteration if the chunk is None, indicating the
-            # end of the audio stream.
-            chunk = self._buff.get()
-            if chunk is None:
-                return
-            data = [chunk]
+	# Toggle spell checking
+	spell_check = False
+	
+	# Infinite loop
+	while True:
 
-            # Now consume whatever other data's still buffered.
-            while True:
-                try:
-                    chunk = self._buff.get(block=False)
-                    if chunk is None:
-                        return
-                    data.append(chunk)
-                except queue.Empty:
-                    break
+		# Display live feed until ESC key is pressed
+		# Press ESC to exit
+		keypress = cv2.waitKey(1)
 
-            yield b''.join(data)
+		# Flip the image laterally
+		#img = cv2.flip(img, 1)
+		
+		# TESTING:
+		#threading.Timer(5.0, printit).start()
+		
+		# Read a single frame from the live feed
+		img = live_stream.read()[1]
 
+		# Set a region of interest
+		cv2.rectangle(img, (70, 70), (350, 350), (0,255,0), 2)
 
-def listen_print_loop(responses):
-    """Iterates through server responses and prints them.
+		# Show the live stream
+		cv2.imshow("Live Stream", img)
+		
+		# To get time intervals
+		if time_counter % 45 == 0 and realTime:
 
-    The responses passed is a generator that will block until a response
-    is provided by the server.
+			letter, score = predict(img)
+			#cv2.imshow("Resized Image", img)
+			print("Letter: ",letter.upper(), " Score: ", score)
+			print("Current word: ", current_word)
 
-    Each response may contain multiple results, and each result may contain
-    multiple alternatives; for details, see https://goo.gl/tjCPAU.  Here we
-    print only the transcription for the top alternative of the top result.
+			if letter.upper() != 'NOTHING' and letter.upper() != 'SPACE' and letter.upper() != 'DEL':
+				current_word += letter.upper()
+				speak_letter(letter)
 
-    In this case, responses are provided for interim results as well. If the
-    response is an interim one, print a line feed at the end of it, to allow
-    the next result to overwrite it, until the response is a final one. For the
-    final one, print a newline to preserve the finalized transcription.
-    """
-    num_chars_printed = 0
-    for response in responses:
-        if not response.results:
-            continue
+			# Say the letter out loud
+			elif letter.upper() == 'SPACE':
+				if len(current_word) > 0:
+					if spell_check:
+						speak_letter(spell_checker.correction(current_word))
+					else:
+						speak_letter(current_word)
+				current_word = ""
 
-        # The `results` list is consecutive. For streaming, we only care about
-        # the first result being considered, since once it's `is_final`, it
-        # moves on to considering the next utterance.
-        result = response.results[0]
-        if not result.alternatives:
-            continue
+			elif letter.upper() == 'DEL':
+				if len(current_word) > 0:
+					current_word = current_word[:-1]
+			
+			elif letter.upper() == 'NOTHING':
+				pass
 
-        # Display the transcription of the top alternative.
-        transcript = result.alternatives[0].transcript
-
-        # Display interim results, but with a carriage return at the end of the
-        # line, so subsequent lines will overwrite them.
-        #
-        # If the previous result was longer than this one, we need to print
-        # some extra spaces to overwrite the previous result
-        overwrite_chars = ' ' * (num_chars_printed - len(transcript))
-
-        if not result.is_final:
-            sys.stdout.write(transcript + overwrite_chars + '\r')
-            sys.stdout.flush()
-
-            num_chars_printed = len(transcript)
-
-        else:
-            return flask.render_template('home.html', same=processInput("".join(transcript).split(" ")), og="".join(transcript))
-
-            # Exit recognition if any of the transcribed phrases could be
-            # one of our keywords.
-            if re.search(r'\b(exit|quit)\b', transcript, re.I):
-                print('Exiting..')
-                break
-
-            num_chars_printed = 0
+			else:
+				print("UNEXPECTED INPUT: ", letter.upper())
 
 
-@app.route('/speech', methods=['GET'])
-def main():
-    # See http://g.co/cloud/speech/docs/languages
-    # for a list of supported languages.
-    language_code = 'en-US'  # a BCP-47 language tag
+		# 'C' is pressed
+		if keypress == ord('c'):
+			captureFlag = True
+			realTime = False
 
-    client = speech.SpeechClient()
-    config = speech.RecognitionConfig(
-        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-        sample_rate_hertz=RATE,
-        language_code=language_code)
-    streaming_config = speech.StreamingRecognitionConfig(
-        config=config,
-        interim_results=True)
+		# 'R' is pressed
+		if keypress == ord('r'):
+			realTime = True
 
-    with MicrophoneStream(RATE, CHUNK) as stream:
-        audio_generator = stream.generator()
-        requests = (speech.StreamingRecognizeRequest(audio_content=content)
-                    for content in audio_generator)
+		if captureFlag:
+			captureFlag = False
 
-        responses = client.streaming_recognize(streaming_config, requests)
+			# Show the image considered for classification
+			# Just for Debugging
+			#cv2.imshow("Resized Image", resized_image)
 
-        # Now, put the transcription responses to use.
-        return listen_print_loop(responses)
+			# Get the letter and the score
+			letter, score = predict(img)
+			print("Letter: ",letter.upper(), " Score: ", score)
+			print("Current word: ", current_word)
 
 
-if __name__ == '__main__':
-    app.run(debug=True)
+			if letter.upper() != 'NOTHING' and letter.upper() != 'SPACE' and letter.upper() != 'DEL':
+				current_word += letter.upper()
+				speak_letter(letter)
+
+			# Say the letter out loud
+			elif letter.upper() == 'SPACE':
+				if len(current_word) > 0:
+					if spell_check:
+						speak_letter(spell_checker.correction(current_word))
+					else:
+						speak_letter(current_word)
+				current_word = ""
+
+			elif letter.upper() == 'DEL':
+				if len(current_word) > 0:
+					current_word = current_word[:-1]
+			
+			elif letter.upper() == 'NOTHING':
+				pass
+
+			else:
+				print("UNEXPECTED INPUT: ", letter.upper())
+
+		# If ESC is pressed
+		if keypress == 27:
+			exit(0)	
+
+		# Update time
+		time_counter = time_counter + 1
+
+# Stop using camers
+live_stream.release()
+
+# Destroy windows created by OpenCV
+cv2.destroyAllWindows()
